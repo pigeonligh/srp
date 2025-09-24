@@ -179,5 +179,4 @@ func (h *handler) HandleProxy(srv *ssh.Server, conn *gossh.ServerConn, newChan g
 
 	h.callbacks.OnProxyConnectionDone(ctx, payload, nil)
 	logrus.Infof("Proxy done for session %v.", ctx.SessionID())
-	<-ctx.Done()
 }
