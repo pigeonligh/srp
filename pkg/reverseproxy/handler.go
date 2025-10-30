@@ -2,7 +2,6 @@ package reverseproxy
 
 import (
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -267,11 +266,11 @@ func handleConnection(c net.Conn, conn *gossh.ServerConn, target string) {
 	go func() {
 		defer ch.Close()
 		defer c.Close()
-		_, _ = io.Copy(ch, c)
+		_ = nets.IOCopy(ch, c)
 	}()
 	go func() {
 		defer ch.Close()
 		defer c.Close()
-		_, _ = io.Copy(c, ch)
+		_ = nets.IOCopy(c, ch)
 	}()
 }
