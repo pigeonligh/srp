@@ -74,8 +74,10 @@ func (h *handler) PasswordHandler() ssh.PasswordHandler {
 			ret = true
 		} else {
 			ret = h.authenticator.Authenticate(ctx, auth.AuthenticateRequest{
-				User:     ctx.User(),
-				Password: password,
+				User:       ctx.User(),
+				Password:   password,
+				RemoteAddr: ctx.RemoteAddr(),
+				LocalAddr:  ctx.LocalAddr(),
 			})
 		}
 
@@ -91,8 +93,10 @@ func (h *handler) PublicKeyHandler() ssh.PublicKeyHandler {
 			ret = true
 		} else {
 			ret = h.authenticator.Authenticate(ctx, auth.AuthenticateRequest{
-				User:      ctx.User(),
-				PublicKey: key,
+				User:       ctx.User(),
+				PublicKey:  key,
+				RemoteAddr: ctx.RemoteAddr(),
+				LocalAddr:  ctx.LocalAddr(),
 			})
 		}
 
@@ -174,8 +178,10 @@ func (h *handler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server, req *gossh.
 
 		if h.authorizer != nil {
 			if !h.authorizer.Authorize(ctx, auth.AuthorizeRequest{
-				User:   ctx.User(),
-				Target: net.JoinHostPort(host, port),
+				User:       ctx.User(),
+				Target:     net.JoinHostPort(host, port),
+				RemoteAddr: ctx.RemoteAddr(),
+				LocalAddr:  ctx.LocalAddr(),
 			}) {
 				logrus.Errorf("User %v request to proxy %v, but it's not allowed.", ctx.User(), reqPayload.BindUnixSocket)
 				return false, []byte{}
