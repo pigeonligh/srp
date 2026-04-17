@@ -51,8 +51,10 @@ func (h *handler) PasswordHandler() ssh.PasswordHandler {
 			ret = true
 		} else {
 			ret = h.authenticator.Authenticate(ctx, auth.AuthenticateRequest{
-				User:     ctx.User(),
-				Password: password,
+				User:       ctx.User(),
+				Password:   password,
+				RemoteAddr: ctx.RemoteAddr(),
+				LocalAddr:  ctx.LocalAddr(),
 			})
 		}
 
@@ -68,8 +70,10 @@ func (h *handler) PublicKeyHandler() ssh.PublicKeyHandler {
 			ret = true
 		} else {
 			ret = h.authenticator.Authenticate(ctx, auth.AuthenticateRequest{
-				User:      ctx.User(),
-				PublicKey: key,
+				User:       ctx.User(),
+				PublicKey:  key,
+				RemoteAddr: ctx.RemoteAddr(),
+				LocalAddr:  ctx.LocalAddr(),
 			})
 		}
 
@@ -105,8 +109,10 @@ func (h *handler) GetProxy(ctx ssh.Context, target string) (Proxy, error) {
 
 	if h.authorizer != nil {
 		if !h.authorizer.Authorize(ctx, auth.AuthorizeRequest{
-			User:   ctx.User(),
-			Target: target,
+			User:       ctx.User(),
+			Target:     target,
+			RemoteAddr: ctx.RemoteAddr(),
+			LocalAddr:  ctx.LocalAddr(),
 		}) {
 			err := fmt.Errorf("access denied")
 			cachedResult = err

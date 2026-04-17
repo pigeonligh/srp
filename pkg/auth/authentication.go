@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net"
 
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -9,9 +10,11 @@ import (
 // req
 
 type AuthenticateRequest struct {
-	User      string
-	Password  string
-	PublicKey gossh.PublicKey
+	User       string
+	Password   string
+	PublicKey  gossh.PublicKey
+	RemoteAddr net.Addr
+	LocalAddr  net.Addr
 }
 
 // def

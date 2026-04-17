@@ -1,12 +1,17 @@
 package auth
 
-import "context"
+import (
+	"context"
+	"net"
+)
 
 // req
 
 type AuthorizeRequest struct {
-	User   string
-	Target string
+	User       string
+	Target     string
+	RemoteAddr net.Addr
+	LocalAddr  net.Addr
 }
 
 // def
