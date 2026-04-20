@@ -28,7 +28,7 @@ func main() {
 	if err != nil {
 		logrus.Fatalln("Error:", err)
 	}
-	provider := providers.SocketProvider(rp, 0)
+	provider := providers.NetDialerProvider(rp)
 	go func() {
 		http.ListenAndServe(httpAddress, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			target := r.Host
