@@ -1,10 +1,9 @@
 package reverseproxy
 
 import (
-	"fmt"
+	"context"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,12 +22,71 @@ type Handler interface {
 
 	HandleSSHRequest(ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (bool, []byte)
 
-	nets.SocketHandler
 	ConvertBindAddressToHostPort(bindAddress string) (string, string, bool)
-	ConvertBindAddressToSocket(bindAddress string) (string, bool)
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 
-	SocketList() []string
+	ListProxies() []string
 	AddEventHandler(EventHandler)
+}
+
+type ld struct {
+	l net.Listener
+	d nets.NetDialer
+}
+
+type proxy struct {
+	host   string
+	port   string
+	errCnt int
+	lds    map[string]ld // sessionID => ld
+	mutex  sync.Mutex
+}
+
+func (p *proxy) addLD(sessionID string, l net.Listener, d nets.NetDialer) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	if len(p.lds) > 16 {
+		return net.InvalidAddrError("too many forward requests for " + net.JoinHostPort(p.host, p.port))
+	}
+	if len(p.lds) > 0 {
+		// 当有相同目标的隧道请求存在时，暂时不接受新的隧道请求，让代理的连接尽可能均衡地分布在不同的 server 实例上
+		// 如果连续出现多个隧道请求，说明可能连接已经较为均匀分布了，因此可以接受多个隧道请求，多个隧道在服务内部进行负载均衡
+		if p.errCnt < 5 {
+			p.errCnt++
+			return net.InvalidAddrError("forward request for " + net.JoinHostPort(p.host, p.port) + " already exists")
+		}
+	}
+	p.errCnt = 0
+	p.lds[sessionID] = ld{l: l, d: d}
+	return nil
+}
+
+func (p *proxy) removeLD(sessionID string) bool {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	_, ok := p.lds[sessionID]
+	if ok {
+		delete(p.lds, sessionID)
+	}
+	p.errCnt = 0
+	return len(p.lds) == 0
+}
+
+func (p *proxy) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	var lastErr error
+	for _, ld := range p.lds {
+		conn, err := ld.d.DialContext(ctx, network, addr)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = net.InvalidAddrError("no proxy for " + addr)
+	}
+	return nil, lastErr
 }
 
 type handler struct {
@@ -36,7 +94,8 @@ type handler struct {
 	authorizer    auth.Authorizer
 	unixDirectory string
 
-	forwards map[string]net.Listener // uid => listener
+	// forwards map[string]net.Listener // uid => listener
+	proxies map[string]*proxy // host:port => proxy
 	sync.Mutex
 
 	eventHandlers EventHandlers
@@ -61,7 +120,8 @@ func New(authenticator auth.Authenticator, authorizer auth.Authorizer, unixDirec
 		authorizer:    authorizer,
 		unixDirectory: unixDirectory,
 
-		forwards: make(map[string]net.Listener),
+		// forwards: make(map[string]net.Listener),
+		proxies: make(map[string]*proxy),
 
 		eventHandlers: make(EventHandlers, 0),
 	}, nil
@@ -118,32 +178,26 @@ func (h *handler) ConvertBindAddressToHostPort(bindAddress string) (string, stri
 	return host, portString, true
 }
 
-func (h *handler) ConvertHostPortToSocket(host, port string) (string, bool) {
-	return filepath.Join(h.unixDirectory, fmt.Sprintf("%v_%v.sock", host, port)), true
-}
-
-func (h *handler) ConvertBindAddressToSocket(bindAddress string) (string, bool) {
-	host, port, ok := h.ConvertBindAddressToHostPort(bindAddress)
-	if ok {
-		return h.ConvertHostPortToSocket(host, port)
-	}
-	return "", false
-}
-
-func (h *handler) SocketAlive(socket string) bool {
+func (h *handler) ProxyAlive(host, port string) bool {
+	target := net.JoinHostPort(host, port)
 	h.Lock()
-	_, ok := h.forwards[socket]
+	p, ok := h.proxies[target]
 	h.Unlock()
-	return ok
+	if !ok {
+		return false
+	}
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	return len(p.lds) > 0
 }
 
-func (h *handler) SocketList() []string {
+func (h *handler) ListProxies() []string {
 	h.Lock()
 	defer h.Unlock()
 
 	ret := make([]string, 0)
-	for socket := range h.forwards {
-		ret = append(ret, socket)
+	for target := range h.proxies {
+		ret = append(ret, target)
 	}
 	return ret
 }
@@ -175,7 +229,6 @@ func (h *handler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server, req *gossh.
 			logrus.Errorf("User %v request to proxy invalid target %v.", ctx.User(), reqPayload.BindUnixSocket)
 			return false, []byte{}
 		}
-
 		if h.authorizer != nil {
 			if !h.authorizer.Authorize(ctx, auth.AuthorizeRequest{
 				User:       ctx.User(),
@@ -188,44 +241,27 @@ func (h *handler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server, req *gossh.
 			}
 		}
 
-		socket, _ := h.ConvertHostPortToSocket(host, port)
-		ln, err := net.Listen("unix", socket)
+		l, d := nets.ListenDialerWithBuffer(1024)
+		err := h.addProxy(host, port, ctx.SessionID(), l, d)
 		if err != nil {
-			logrus.Errorf("Failed to listen UnixSocket %v: %v", socket, err)
+			logrus.Errorf("Failed to add proxy for %v(%v:%v): %v", ctx.SessionID(), host, port, err)
 			return false, []byte{}
 		}
-		h.Lock()
-		h.forwards[socket] = ln
-		h.eventHandlers.OnAdd(host, port)
-		h.Unlock()
-
 		go func() {
 			<-ctx.Done()
-			h.Lock()
-			ln, ok := h.forwards[socket]
-			h.Unlock()
-			if ok {
-				ln.Close()
-			}
+			_ = l.Close()
 		}()
-
 		go func() {
 			for {
-				c, err := ln.Accept()
+				c, err := l.Accept()
 				if err != nil {
-					logrus.Errorf("Failed to accept connection for %v: %v", socket, err)
+					logrus.Errorf("Failed to accept connection for %v(%v:%v): %v", ctx.SessionID(), host, port, err)
 					break
 				}
-
 				go handleConnection(c, conn, reqPayload.BindUnixSocket)
 			}
-			h.Lock()
-			delete(h.forwards, socket)
-			h.eventHandlers.OnRemove(host, port)
-			h.Unlock()
+			h.removeProxy(host, port, ctx.SessionID())
 		}()
-
-		logrus.Infof("Forward request in %v is ready", socket)
 		return true, nil
 
 	case protocol.CancelRequestType:
@@ -237,24 +273,62 @@ func (h *handler) HandleSSHRequest(ctx ssh.Context, srv *ssh.Server, req *gossh.
 			return false, []byte{}
 		}
 
-		socket, ok := h.ConvertBindAddressToSocket(reqPayload.BindUnixSocket)
+		host, port, ok := h.ConvertBindAddressToHostPort(reqPayload.BindUnixSocket)
 		if !ok {
 			logrus.Errorf("User %v request cancel %v, but it's not allowed.", ctx.User(), reqPayload.BindUnixSocket)
 			return false, []byte{}
 		}
-
-		h.Lock()
-		ln, ok := h.forwards[socket]
-		h.Unlock()
-		if ok {
-			ln.Close()
-			logrus.Infof("Forward request in %v is canneled", socket)
-		}
+		h.removeProxy(host, port, ctx.SessionID())
 		return true, nil
 	}
 
 	logrus.Infof("Unknown request %v from user %v", req.Type, ctx.User())
 	return false, []byte{}
+}
+
+func (h *handler) addProxy(host, port, sessionID string, l net.Listener, d nets.NetDialer) error {
+	target := net.JoinHostPort(host, port)
+	h.Lock()
+	defer h.Unlock()
+	p, ok := h.proxies[target]
+	if !ok {
+		p = &proxy{
+			host: host,
+			port: port,
+			lds:  make(map[string]ld),
+		}
+		h.proxies[target] = p
+		h.eventHandlers.OnAdd(host, port)
+	}
+	if err := p.addLD(sessionID, l, d); err != nil {
+		return err
+	}
+	logrus.Infof("Forward request in %v %v is ready", sessionID, target)
+	return nil
+}
+
+func (h *handler) removeProxy(host, port, sessionID string) {
+	target := net.JoinHostPort(host, port)
+	h.Lock()
+	defer h.Unlock()
+	p, ok := h.proxies[target]
+	if ok {
+		if p.removeLD(sessionID) {
+			delete(h.proxies, target)
+			h.eventHandlers.OnRemove(host, port)
+		}
+	}
+	logrus.Infof("Forward request in %v %v is canceled", sessionID, target)
+}
+
+func (h *handler) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	h.Lock()
+	p, ok := h.proxies[addr]
+	h.Unlock()
+	if !ok {
+		return nil, net.InvalidAddrError("no proxy for " + addr)
+	}
+	return p.DialContext(ctx, network, addr)
 }
 
 func handleConnection(c net.Conn, conn *gossh.ServerConn, target string) {

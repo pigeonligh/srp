@@ -33,7 +33,7 @@ func main() {
 	p := proxy.New(
 		auth.UserPublicKeysAuthenticator(auth.PublicKeysDir("examples/auth/proxy_auth")),
 		auth.UserGlobsAuthorizer(auth.UserGlobsDir("examples/auth/proxy_rules")),
-		providers.SocketProvider(rp, 0),
+		providers.NetDialerProvider(rp),
 		true,
 	)
 
